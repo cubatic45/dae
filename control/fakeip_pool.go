@@ -6,6 +6,8 @@
 package control
 
 import (
+	"container/list"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -18,6 +20,8 @@ const (
 	FakeIPTTL = 1 * time.Hour
 	// FakeIPCleanupInterval is the execution interval for cleanup tasks (10 minutes)
 	FakeIPCleanupInterval = 10 * time.Minute
+	// DefaultMaxEntries is the default maximum number of entries in the pool
+	DefaultMaxEntries = 10000
 )
 
 // fakeipEntry represents a fakeip entry
@@ -27,18 +31,26 @@ type fakeipEntry struct {
 	expireTime time.Time
 }
 
-// fakeipPool is a fakeip pool implementation with automatic cleanup
+// lruItem represents an item in the LRU cache
+type lruItem struct {
+	domain string
+	entry  *fakeipEntry
+}
+
+// fakeipPool is a fakeip pool implementation with LRU cache and automatic cleanup
 // Uses the 198.18.0.0/16 address range as the fakeip pool
 type fakeipPool struct {
 	mu            sync.RWMutex
-	domainToEntry map[string]*fakeipEntry // mapping from domain to entry
-	ipToDomain    map[string]string       // reverse mapping from IP to domain
-	baseIP        net.IP                  // base IP address (198.18.0.0)
-	currentOffset uint32                  // current allocation offset
-	maxOffset     uint32                  // maximum offset (65536)
-	ttl           time.Duration           // TTL for entries
-	stopChan      chan struct{}           // channel to stop cleanup goroutine
-	cleanupTicker *time.Ticker            // cleanup ticker
+	domainToElem  map[string]*list.Element // mapping from domain to list element
+	ipToDomain    map[string]string        // reverse mapping from IP to domain
+	lruList       *list.List               // LRU doubly linked list
+	baseIP        net.IP                   // base IP address (198.18.0.0)
+	currentOffset uint32                   // current allocation offset
+	maxOffset     uint32                   // maximum offset (65536)
+	maxEntries    int                      // maximum number of entries
+	ttl           time.Duration            // TTL for entries
+	stopChan      chan struct{}            // channel to stop cleanup goroutine
+	cleanupTicker *time.Ticker             // cleanup ticker
 }
 
 var (
@@ -58,10 +70,12 @@ func GetGlobalFakeipPool() *fakeipPool {
 // newFakeipPool creates a new fakeip pool
 func newFakeipPool() *fakeipPool {
 	return &fakeipPool{
-		domainToEntry: make(map[string]*fakeipEntry),
+		domainToElem:  make(map[string]*list.Element),
 		ipToDomain:    make(map[string]string),
+		lruList:       list.New(),
 		baseIP:        net.ParseIP("198.18.0.0").To4(),
 		maxOffset:     65536, // 198.18.0.0/16 can allocate 65536 addresses
+		maxEntries:    DefaultMaxEntries,
 		ttl:           FakeIPTTL,
 		stopChan:      make(chan struct{}),
 		currentOffset: defaultOffset,
@@ -93,21 +107,22 @@ func (p *fakeipPool) cleanup() {
 	defer p.mu.Unlock()
 
 	now := time.Now()
-	expiredDomains := make([]string, 0)
+	expiredElems := make([]*list.Element, 0)
 
-	// find all expired domains
-	for domain, entry := range p.domainToEntry {
-		if now.After(entry.expireTime) {
-			expiredDomains = append(expiredDomains, domain)
+	// find all expired entries from the back (oldest)
+	for elem := p.lruList.Back(); elem != nil; elem = elem.Prev() {
+		item := elem.Value.(*lruItem)
+		if now.After(item.entry.expireTime) {
+			expiredElems = append(expiredElems, elem)
 		}
 	}
 
 	// delete expired entries
-	for _, domain := range expiredDomains {
-		if entry, exists := p.domainToEntry[domain]; exists {
-			delete(p.ipToDomain, entry.ip.String())
-			delete(p.domainToEntry, domain)
-		}
+	for _, elem := range expiredElems {
+		item := elem.Value.(*lruItem)
+		delete(p.ipToDomain, item.entry.ip.String())
+		delete(p.domainToElem, item.domain)
+		p.lruList.Remove(elem)
 	}
 }
 
@@ -123,10 +138,17 @@ func (p *fakeipPool) allocate(domain string) net.IP {
 
 	now := time.Now()
 
-	// if the domain already has an IP, update expiration time and return
-	if entry, exists := p.domainToEntry[domain]; exists {
-		entry.expireTime = now.Add(p.ttl)
-		return entry.ip
+	// if the domain already has an IP, update expiration time and move to front (most recently used)
+	if elem, exists := p.domainToElem[domain]; exists {
+		item := elem.Value.(*lruItem)
+		item.entry.expireTime = now.Add(p.ttl)
+		p.lruList.MoveToFront(elem)
+		return item.entry.ip
+	}
+
+	// evict LRU entry if we've reached max capacity
+	if p.lruList.Len() >= p.maxEntries {
+		p.evictOldest()
 	}
 
 	// allocate a new IP
@@ -152,14 +174,36 @@ func (p *fakeipPool) allocate(domain string) net.IP {
 	// if this IP is already occupied, clean up the old mapping first
 	ipStr := ip.String()
 	if oldDomain, exists := p.ipToDomain[ipStr]; exists {
-		delete(p.domainToEntry, oldDomain)
+		if oldElem, ok := p.domainToElem[oldDomain]; ok {
+			p.lruList.Remove(oldElem)
+			delete(p.domainToElem, oldDomain)
+		}
 	}
 
+	// create LRU item and add to front (most recently used)
+	item := &lruItem{
+		domain: domain,
+		entry:  entry,
+	}
+	elem := p.lruList.PushFront(item)
+
 	// save mapping relationships
-	p.domainToEntry[domain] = entry
+	p.domainToElem[domain] = elem
 	p.ipToDomain[ipStr] = domain
 
 	return ip
+}
+
+// evictOldest removes the least recently used entry
+// must be called with lock held
+func (p *fakeipPool) evictOldest() {
+	elem := p.lruList.Back()
+	if elem != nil {
+		item := elem.Value.(*lruItem)
+		delete(p.ipToDomain, item.entry.ip.String())
+		delete(p.domainToElem, item.domain)
+		p.lruList.Remove(elem)
+	}
 }
 
 // lookup finds the corresponding domain for a fake IP
@@ -173,11 +217,13 @@ func (p *fakeipPool) lookup(ip net.IP) (string, bool) {
 	}
 
 	// check if expired
-	if entry, ok := p.domainToEntry[domain]; ok {
-		if time.Now().After(entry.expireTime) {
+	if elem, ok := p.domainToElem[domain]; ok {
+		item := elem.Value.(*lruItem)
+		if time.Now().After(item.entry.expireTime) {
 			return "", false
 		}
 	}
+
 	if strings.HasSuffix(domain, ".") {
 		return domain[:len(domain)-1], true
 	}
@@ -189,5 +235,23 @@ func (p *fakeipPool) lookup(ip net.IP) (string, bool) {
 func (p *fakeipPool) GetStats() (total int, allocated int) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return int(p.maxOffset), len(p.domainToEntry)
+	return int(p.maxOffset), p.lruList.Len()
+}
+
+type fakeipConn struct {
+	net.Conn
+	domain string
+	dport  uint16
+}
+
+func (c fakeipConn) LocalAddr() net.Addr {
+	return c
+}
+
+func (c fakeipConn) String() string {
+	return fmt.Sprintf("%v:%d", c.domain, c.dport)
+}
+
+func (c fakeipConn) Network() string {
+	return c.Conn.LocalAddr().Network()
 }

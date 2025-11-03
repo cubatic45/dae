@@ -41,9 +41,7 @@ const (
 	IpVersionPrefer_6  IpVersionPrefer = 6
 )
 
-var (
-	ErrUnsupportedQuestionType = fmt.Errorf("unsupported question type")
-)
+var ErrUnsupportedQuestionType = fmt.Errorf("unsupported question type")
 
 var (
 	UnspecifiedAddressA    = netip.MustParseAddr("0.0.0.0")
@@ -77,8 +75,7 @@ type DnsController struct {
 
 	fixedDomainTtl map[string]int
 	// mutex protects the dnsCache.
-	dnsCacheMu          sync.Mutex
-	dnsCache            map[string]*DnsCache
+	dnsCache            sync.Map
 	dnsForwarderCacheMu sync.Mutex
 	dnsForwarderCache   map[dnsForwarderKey]DnsForwarder
 }
@@ -120,8 +117,7 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 		timeoutExceedCallback: option.TimeoutExceedCallback,
 
 		fixedDomainTtl:      option.FixedDomainTtl,
-		dnsCacheMu:          sync.Mutex{},
-		dnsCache:            make(map[string]*DnsCache),
+		dnsCache:            sync.Map{},
 		dnsForwarderCacheMu: sync.Mutex{},
 		dnsForwarderCache:   make(map[dnsForwarderKey]DnsForwarder),
 	}, nil
@@ -133,17 +129,20 @@ func (c *DnsController) cacheKey(qname string, qtype uint16) string {
 }
 
 func (c *DnsController) RemoveDnsRespCache(cacheKey string) {
-	c.dnsCacheMu.Lock()
-	_, ok := c.dnsCache[cacheKey]
-	if ok {
-		delete(c.dnsCache, cacheKey)
-	}
-	c.dnsCacheMu.Unlock()
+	c.dnsCache.Delete(cacheKey)
 }
+
+func (c *DnsController) lookupCache(cacheKey string) (*DnsCache, bool) {
+	cacheAny, ok := c.dnsCache.Load(cacheKey)
+	if !ok {
+		return nil, false
+	}
+	cache, ok := cacheAny.(*DnsCache)
+	return cache, ok
+}
+
 func (c *DnsController) LookupDnsRespCache(cacheKey string, ignoreFixedTtl bool) (cache *DnsCache) {
-	c.dnsCacheMu.Lock()
-	cache, ok := c.dnsCache[cacheKey]
-	c.dnsCacheMu.Unlock()
+    cache, ok := c.lookupCache(cacheKey)
 	if !ok {
 		return nil
 	}
@@ -156,6 +155,7 @@ func (c *DnsController) LookupDnsRespCache(cacheKey string, ignoreFixedTtl bool)
 	// We should make sure the cache did not expire, or
 	// return nil and request a new lookup to refresh the cache.
 	if !deadline.After(time.Now()) {
+		c.RemoveDnsRespCache(cacheKey)
 		return nil
 	}
 	if err := c.cacheAccessCallback(cache); err != nil {
@@ -287,21 +287,17 @@ func (c *DnsController) __updateDnsCacheDeadline(host string, dnsTyp uint16, ans
 	deadline, originalDeadline := deadlineFunc(now, host)
 
 	cacheKey := c.cacheKey(fqdn, dnsTyp)
-	c.dnsCacheMu.Lock()
-	cache, ok := c.dnsCache[cacheKey]
+	cache, ok := c.lookupCache(cacheKey)
 	if ok {
 		cache.Answer = answers
 		cache.Deadline = deadline
 		cache.OriginalDeadline = originalDeadline
-		c.dnsCacheMu.Unlock()
 	} else {
 		cache, err = c.newCache(fqdn, answers, deadline, originalDeadline)
 		if err != nil {
-			c.dnsCacheMu.Unlock()
 			return err
 		}
-		c.dnsCache[cacheKey] = cache
-		c.dnsCacheMu.Unlock()
+		c.dnsCache.Store(cacheKey, cache)
 	}
 	if err = c.cacheAccessCallback(cache); err != nil {
 		return err

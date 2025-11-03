@@ -43,6 +43,7 @@ func (c *ControlPlane) handleConn(lConn net.Conn) (err error) {
 	realDomain, ok := GetGlobalFakeipPool().lookup(dst.Addr().AsSlice())
 	if ok {
 		domain = realDomain
+		newLConn = fakeipConn{Conn: lConn, domain: realDomain, dport: dst.Port()}
 	} else {
 		// Sniff target domain.
 		sniffer = sniffing.NewConnSniffer(lConn, c.sniffingTimeout)
