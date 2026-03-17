@@ -1128,6 +1128,13 @@ new_connection:;
 		if (!(tcph.syn && !tcph.ack)) {
 			// Not a new TCP connection.
 			// Perhaps single-arm.
+			// Re-apply fwmark so that non-SYN packets of a direct(mark:N)
+			// flow still follow fwmark-based policy routing.
+			struct routing_result *routing_result =
+				bpf_map_lookup_elem(&routing_tuples_map,
+						    &tuples.five);
+			if (routing_result)
+				skb->mark = routing_result->mark;
 			return TC_ACT_OK;
 		}
 		params.l4hdr = &tcph;
@@ -1497,22 +1504,26 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 		}
 
 		if (unlikely(tcp_state_syn)) {
-			struct routing_result routing_result = {};
+			// Only save non-direct routing to avoid conflicts with LAN ingress.
+			// Direct traffic doesn't need control plane processing.
+			if (outbound != OUTBOUND_DIRECT || mark != 0 || must) {
+				struct routing_result routing_result = {};
 
-			routing_result.outbound = outbound;
-			routing_result.mark = mark;
-			routing_result.must = must;
-			routing_result.dscp = tuples.dscp;
-			__builtin_memcpy(routing_result.mac, ethh.h_source,
-					 sizeof(ethh.h_source));
-			if (pid_pname) {
-				__builtin_memcpy(routing_result.pname,
-						 pid_pname->pname,
-						 TASK_COMM_LEN);
-				routing_result.pid = pid_pname->pid;
+				routing_result.outbound = outbound;
+				routing_result.mark = mark;
+				routing_result.must = must;
+				routing_result.dscp = tuples.dscp;
+				__builtin_memcpy(routing_result.mac, ethh.h_source,
+						 sizeof(ethh.h_source));
+				if (pid_pname) {
+					__builtin_memcpy(routing_result.pname,
+							 pid_pname->pname,
+							 TASK_COMM_LEN);
+					routing_result.pid = pid_pname->pid;
+				}
+				bpf_map_update_elem(&routing_tuples_map, &tuples.five,
+						    &routing_result, BPF_ANY);
 			}
-			bpf_map_update_elem(&routing_tuples_map, &tuples.five,
-					    &routing_result, BPF_ANY);
 		}
 
 	} else if (l4proto == IPPROTO_UDP) {
@@ -1566,22 +1577,31 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 			bpf_printk("shot routing: %d", s64_ret);
 			return TC_ACT_SHOT;
 		}
-		// Construct new hdr to encap.
-		struct routing_result routing_result = {};
+		// Extract routing values.
+		__u8 outbound = s64_ret & 0xff;
+		__u32 mark = s64_ret >> 8;
+		bool must = (s64_ret >> 40) & 1;
 
-		routing_result.outbound = s64_ret;
-		routing_result.mark = s64_ret >> 8;
-		routing_result.must = (s64_ret >> 40) & 1;
-		routing_result.dscp = tuples.dscp;
-		__builtin_memcpy(routing_result.mac, ethh.h_source,
-				 sizeof(ethh.h_source));
-		if (pid_pname) {
-			__builtin_memcpy(routing_result.pname, pid_pname->pname,
-					 TASK_COMM_LEN);
-			routing_result.pid = pid_pname->pid;
+		// Only save non-direct routing to avoid conflicts with LAN ingress.
+		// Direct traffic doesn't need control plane processing.
+		if (outbound != OUTBOUND_DIRECT || mark != 0 || must) {
+			// Construct new hdr to encap.
+			struct routing_result routing_result = {};
+
+			routing_result.outbound = outbound;
+			routing_result.mark = mark;
+			routing_result.must = must;
+			routing_result.dscp = tuples.dscp;
+			__builtin_memcpy(routing_result.mac, ethh.h_source,
+					 sizeof(ethh.h_source));
+			if (pid_pname) {
+				__builtin_memcpy(routing_result.pname, pid_pname->pname,
+						 TASK_COMM_LEN);
+				routing_result.pid = pid_pname->pid;
+			}
+			bpf_map_update_elem(&routing_tuples_map, &tuples.five,
+					    &routing_result, BPF_ANY);
 		}
-		bpf_map_update_elem(&routing_tuples_map, &tuples.five,
-				    &routing_result, BPF_ANY);
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
 		__u32 pid = pid_pname ? pid_pname->pid : 0;
 
@@ -1589,17 +1609,17 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 			   tuples.five.sip.u6_addr32,
 			   bpf_ntohs(tuples.five.sport), pid);
 		bpf_printk("udp(wan): outbound: %u, %pI6:%u",
-			   routing_result.outbound, tuples.five.dip.u6_addr32,
+			   outbound, tuples.five.dip.u6_addr32,
 			   bpf_ntohs(tuples.five.dport));
 #endif
 
-		if (routing_result.outbound == OUTBOUND_DIRECT &&
-		    routing_result.mark == 0
+		if (outbound == OUTBOUND_DIRECT &&
+		    mark == 0
 		    // If mark is not zero, we should re-route it, so we send it to control
 		    // plane in WAN.
 		) {
 			return TC_ACT_OK;
-		} else if (unlikely(routing_result.outbound ==
+		} else if (unlikely(outbound ==
 				    OUTBOUND_BLOCK)) {
 			return TC_ACT_SHOT;
 		}
@@ -1609,7 +1629,7 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 		// Check outbound connectivity in specific ipversion and l4proto.
 		struct outbound_connectivity_query q = { 0 };
 
-		q.outbound = routing_result.outbound;
+		q.outbound = outbound;
 		q.ipversion = skb->protocol == bpf_htons(ETH_P_IP) ? 4 : 6;
 		q.l4proto = l4proto;
 		__u32 *alive;
@@ -1890,124 +1910,6 @@ int tproxy_wan_cg_sendmsg6(struct bpf_sock_addr *ctx)
 {
 	update_map_elem_by_cookie(bpf_get_socket_cookie(ctx));
 	return 1;
-}
-
-SEC("sockops")
-int local_tcp_sockops(struct bpf_sock_ops *skops)
-{
-	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-	__u32 pid = BPF_CORE_READ(task, pid);
-
-	/* Only local TCP connection has non-zero pids. */
-	if (pid == 0)
-		return 0;
-
-	struct tuples_key tuple = {};
-
-	tuple.l4proto = IPPROTO_TCP;
-	tuple.sport = bpf_htonl(skops->local_port) >> 16;
-	tuple.dport = skops->remote_port >> 16;
-	if (skops->family == AF_INET) {
-		tuple.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
-		tuple.sip.u6_addr32[3] = skops->local_ip4;
-		tuple.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
-		tuple.dip.u6_addr32[3] = skops->remote_ip4;
-	} else if (skops->family == AF_INET6) {
-		tuple.sip.u6_addr32[3] = skops->local_ip6[3];
-		tuple.sip.u6_addr32[2] = skops->local_ip6[2];
-		tuple.sip.u6_addr32[1] = skops->local_ip6[1];
-		tuple.sip.u6_addr32[0] = skops->local_ip6[0];
-		tuple.dip.u6_addr32[3] = skops->remote_ip6[3];
-		tuple.dip.u6_addr32[2] = skops->remote_ip6[2];
-		tuple.dip.u6_addr32[1] = skops->remote_ip6[1];
-		tuple.dip.u6_addr32[0] = skops->remote_ip6[0];
-	} else {
-		return 0;
-	}
-
-	switch (skops->op) {
-	case BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB: // dae sockets
-	{
-		struct tuples_key rev_tuple = {};
-
-		copy_reversed_tuples(&tuple, &rev_tuple);
-
-		struct routing_result *routing_result;
-
-		routing_result =
-			bpf_map_lookup_elem(&routing_tuples_map, &rev_tuple);
-		if (!routing_result || !routing_result->pid)
-			break;
-
-		if (!bpf_sock_hash_update(skops, &fast_sock, &tuple, BPF_ANY))
-			bpf_printk("fast_sock added: %pI4:%lu -> %pI4:%lu",
-				   &tuple.sip.u6_addr32[3],
-				   bpf_ntohs(tuple.sport),
-				   &tuple.dip.u6_addr32[3],
-				   bpf_ntohs(tuple.dport));
-		break;
-	}
-
-	case BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB: // local client sockets
-	{
-		struct routing_result *routing_result;
-
-		routing_result =
-			bpf_map_lookup_elem(&routing_tuples_map, &tuple);
-		if (!routing_result || !routing_result->pid)
-			break;
-
-		if (!bpf_sock_hash_update(skops, &fast_sock, &tuple, BPF_ANY))
-			bpf_printk("fast_sock added: %pI4:%lu -> %pI4:%lu",
-				   &tuple.sip.u6_addr32[3],
-				   bpf_ntohs(tuple.sport),
-				   &tuple.dip.u6_addr32[3],
-				   bpf_ntohs(tuple.dport));
-		break;
-	}
-
-	default:
-		break;
-	}
-
-	return 0;
-}
-
-SEC("sk_msg/fast_redirect")
-int sk_msg_fast_redirect(struct sk_msg_md *msg)
-{
-	struct tuples_key rev_tuple = {};
-
-	rev_tuple.l4proto = IPPROTO_TCP;
-	rev_tuple.sport = msg->remote_port >> 16;
-	rev_tuple.dport = bpf_htonl(msg->local_port) >> 16;
-	if (msg->family == AF_INET) {
-		rev_tuple.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
-		rev_tuple.sip.u6_addr32[3] = msg->remote_ip4;
-		rev_tuple.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
-		rev_tuple.dip.u6_addr32[3] = msg->local_ip4;
-	} else if (msg->family == AF_INET6) {
-		rev_tuple.sip.u6_addr32[3] = msg->remote_ip6[3];
-		rev_tuple.sip.u6_addr32[2] = msg->remote_ip6[2];
-		rev_tuple.sip.u6_addr32[1] = msg->remote_ip6[1];
-		rev_tuple.sip.u6_addr32[0] = msg->remote_ip6[0];
-		rev_tuple.dip.u6_addr32[3] = msg->local_ip6[3];
-		rev_tuple.dip.u6_addr32[2] = msg->local_ip6[2];
-		rev_tuple.dip.u6_addr32[1] = msg->local_ip6[1];
-		rev_tuple.dip.u6_addr32[0] = msg->local_ip6[0];
-	} else {
-		return SK_PASS;
-	}
-
-	if (bpf_msg_redirect_hash(msg, &fast_sock, &rev_tuple, BPF_F_INGRESS) ==
-	    SK_PASS)
-		bpf_printk("tcp fast redirect: %pI4:%lu -> %pI4:%lu",
-			   &rev_tuple.sip.u6_addr32[3],
-			   bpf_ntohs(rev_tuple.sport),
-			   &rev_tuple.dip.u6_addr32[3],
-			   bpf_ntohs(rev_tuple.dport));
-
-	return SK_PASS;
 }
 
 SEC("license") const char __license[] = "Dual BSD/GPL";
