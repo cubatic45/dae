@@ -601,6 +601,11 @@ func (c *ControlPlane) handlePktWithPrefetch(data []byte, src, realDst netip.Add
 }
 
 func (c *ControlPlane) handlePktOwned(data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision, prefetched *UdpEndpoint, prefetchKey UdpEndpointKey, prefetchOK bool) (err error) {
+	// Keep this packet's conn-state alive while an old endpoint retires and
+	// its replacement acquires ownership. Otherwise the old endpoint can
+	// delete the attribution the kernel established for this very packet.
+	releasePacketState := c.pinUdpConnStateForPacket(src, realDst)
+	defer releasePacketState.release(c.log)
 	var realSrc netip.AddrPort
 	var domain string
 	var ueKey UdpEndpointKey
